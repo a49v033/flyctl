@@ -6,103 +6,191 @@ import (
 	"io"
 	"os"
 
-	"github.com/buildpacks/pack"
-	"github.com/superfly/flyctl/flyctl"
+	packclient "github.com/buildpacks/pack/pkg/client"
+	projectTypes "github.com/buildpacks/pack/pkg/project/types"
+	"github.com/pkg/errors"
 	"github.com/superfly/flyctl/internal/cmdfmt"
-	"github.com/superfly/flyctl/pkg/iostreams"
+	"github.com/superfly/flyctl/internal/metrics"
+	"github.com/superfly/flyctl/internal/tracing"
+	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/terminal"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type buildpacksBuilder struct{}
 
-func (ds *buildpacksBuilder) Name() string {
+func (*buildpacksBuilder) Name() string {
 	return "Buildpacks"
 }
 
-func (s *buildpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts ImageOptions) (*DeploymentImage, error) {
+func returnTrue(s string) bool {
+	return true
+}
+
+func (*buildpacksBuilder) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts ImageOptions, build *build) (*DeploymentImage, string, error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "buildpacks_builder", trace.WithAttributes(opts.ToSpanAttributes()...))
+	defer span.End()
+
+	build.BuildStart()
 	if !dockerFactory.mode.IsAvailable() {
-		terminal.Debug("docker daemon not available, skipping")
-		return nil, nil
+		note := "docker daemon not available, skipping"
+		span.AddEvent(note)
+		terminal.Debug(note)
+		build.BuildFinish()
+		return nil, note, nil
 	}
 
-	if !opts.AppConfig.HasBuilder() {
-		terminal.Debug("no buildpack builder configured, skipping")
-		return nil, nil
+	if opts.Builder == "" {
+		note := "no buildpack builder configured, skipping"
+		terminal.Debug(note)
+		span.AddEvent(note)
+		build.BuildFinish()
+		return nil, note, nil
 	}
 
-	builder := opts.AppConfig.Build.Builder
-	buildpacks := opts.AppConfig.Build.Buildpacks
+	builder := opts.Builder
+	buildpacks := opts.Buildpacks
 
-	docker, err := dockerFactory.buildFn(ctx)
+	span.SetAttributes(attribute.StringSlice("buildpacks", buildpacks))
+	span.SetAttributes(attribute.String("builder", builder))
+
+	build.BuilderInitStart()
+	docker, err := dockerFactory.buildFn(ctx, build)
 	if err != nil {
-		return nil, err
+		build.BuilderInitFinish()
+		build.BuildFinish()
+		return nil, "", err
 	}
 
+	defer docker.Close() // skipcq: GO-S2307
 	defer clearDeploymentTags(ctx, docker, opts.Tag)
 
-	packClient, err := pack.NewClient(pack.WithDockerClient(docker), pack.WithLogger(newPackLogger(streams.Out)))
+	packClient, err := packclient.NewClient(packclient.WithDockerClient(docker), packclient.WithLogger(newPackLogger(streams.Out)))
 	if err != nil {
-		return nil, err
+		build.BuilderInitFinish()
+		build.BuildFinish()
+		tracing.RecordError(span, err, "failed to create packet client")
+		return nil, "", err
 	}
+	build.BuilderInitFinish()
 
+	build.ImageBuildStart()
 	serverInfo, err := docker.Info(ctx)
 	if err != nil {
+		tracing.RecordError(span, err, "failed to fetch docker server info")
 		terminal.Debug("error fetching docker server info:", err)
+	} else {
+		build.SetBuilderMetaPart2(false, serverInfo.ServerVersion, fmt.Sprintf("%s/%s/%s", serverInfo.OSType, serverInfo.Architecture, serverInfo.OSVersion))
 	}
 
 	cmdfmt.PrintBegin(streams.ErrOut, "Building image with Buildpacks")
 	msg := fmt.Sprintf("docker host: %s %s %s", serverInfo.ServerVersion, serverInfo.OSType, serverInfo.Architecture)
 	cmdfmt.PrintDone(streams.ErrOut, msg)
 
-	err = packClient.Build(ctx, pack.BuildOptions{
+	span.AddEvent(msg)
+
+	build.ContextBuildStart()
+	excludes, err := readDockerignore(opts.WorkingDir, opts.IgnorefilePath, "")
+	if err != nil {
+		tracing.RecordError(span, err, "error reading .dockerignore")
+		build.ContextBuildFinish()
+		build.BuildFinish()
+		return nil, "", errors.Wrap(err, "error reading .dockerignore")
+	}
+	build.ContextBuildFinish()
+
+	if opts.BuildpacksDockerHost != "" {
+		cmdfmt.PrintDone(streams.ErrOut, fmt.Sprintf("buildpacks docker host: %v", opts.BuildpacksDockerHost))
+	}
+	if len(opts.BuildpacksVolumes) > 0 {
+		cmdfmt.PrintDone(streams.ErrOut, fmt.Sprintf("buildpacks volumes: %+v", opts.BuildpacksVolumes))
+	}
+
+	buildCtx, buildSpan := tracing.GetTracer().Start(ctx, "build_image",
+		trace.WithAttributes(opts.ToSpanAttributes()...),
+		trace.WithAttributes(
+			attribute.String("type", "buildpack"),
+			attribute.Bool("is_remote", dockerFactory.IsRemote()),
+		),
+	)
+	var gid = -1
+	var uid = -1
+	err = packClient.Build(buildCtx, packclient.BuildOptions{
 		AppPath:        opts.WorkingDir,
 		Builder:        builder,
 		ClearCache:     opts.NoCache,
 		Image:          newCacheTag(opts.AppName),
+		DockerHost:     opts.BuildpacksDockerHost,
 		Buildpacks:     buildpacks,
-		Env:            normalizeBuildArgs(opts.AppConfig, opts.ExtraBuildArgs),
-		TrustBuilder:   true,
+		Env:            normalizeBuildArgs(opts.BuildArgs),
+		UserID:         uid,
+		GroupID:        gid,
+		TrustBuilder:   returnTrue,
 		AdditionalTags: []string{opts.Tag},
+		ProjectDescriptor: projectTypes.Descriptor{
+			Build: projectTypes.Build{
+				Exclude: excludes,
+			},
+		},
+		ContainerConfig: packclient.ContainerConfig{
+			Volumes: opts.BuildpacksVolumes,
+		},
 	})
-
+	build.ImageBuildFinish()
+	build.BuildFinish()
 	if err != nil {
-		return nil, err
+		if dockerFactory.IsRemote() {
+			buildSpan.AddEvent("bad build caused by remote builder failure")
+			metrics.SendNoData(ctx, "remote_builder_failure")
+		}
+		buildSpan.SetAttributes(attribute.Bool("is_remote", dockerFactory.IsRemote()))
+		tracing.RecordError(buildSpan, err, "failed to build image")
+		buildSpan.End()
+		return nil, "", err
 	}
+
+	buildSpan.End()
 
 	cmdfmt.PrintDone(streams.ErrOut, "Building image done")
 
 	if opts.Publish {
+		build.PushStart()
 		cmdfmt.PrintBegin(streams.ErrOut, "Pushing image to fly")
 
 		if err := pushToFly(ctx, docker, streams, opts.Tag); err != nil {
-			return nil, err
+			build.PushFinish()
+			return nil, "", err
 		}
+		build.PushFinish()
 
 		cmdfmt.PrintDone(streams.ErrOut, "Pushing image done")
 	}
 
-	img, err := findImageWithDocker(docker, ctx, opts.Tag)
+	img, err := findImageWithDocker(ctx, docker, opts.Tag)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	if img == nil {
+		tracing.RecordError(span, err, "no image found")
+		return nil, "", fmt.Errorf("no image found")
 	}
 
-	return &DeploymentImage{
+	di := DeploymentImage{
 		ID:   img.ID,
 		Tag:  opts.Tag,
 		Size: img.Size,
-	}, nil
-}
-
-func normalizeBuildArgs(appConfig *flyctl.AppConfig, extra map[string]string) map[string]string {
-	var out = map[string]string{}
-
-	if appConfig.Build != nil {
-		for k, v := range appConfig.Build.Args {
-			out[k] = v
-		}
 	}
 
-	for k, v := range extra {
+	span.SetAttributes(di.ToSpanAttributes()...)
+
+	return &di, "", nil
+}
+
+func normalizeBuildArgs(buildArgs map[string]string) map[string]string {
+	out := map[string]string{}
+
+	for k, v := range buildArgs {
 		out[k] = v
 	}
 

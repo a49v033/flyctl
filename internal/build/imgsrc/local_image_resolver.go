@@ -6,71 +6,90 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/image"
 	dockerclient "github.com/docker/docker/client"
 	dockerparser "github.com/novln/docker-parser"
 	"github.com/pkg/errors"
 	"github.com/superfly/flyctl/internal/cmdfmt"
-	"github.com/superfly/flyctl/pkg/iostreams"
+	"github.com/superfly/flyctl/internal/tracing"
+	"github.com/superfly/flyctl/iostreams"
 	"github.com/superfly/flyctl/terminal"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type localImageResolver struct{}
 
-func (s *localImageResolver) Name() string {
+func (*localImageResolver) Name() string {
 	return "Local Image Reference"
 }
 
-func imageRefFromOpts(opts RefOptions) string {
-	if opts.ImageRef != "" {
-		return opts.ImageRef
-	}
+func (*localImageResolver) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts RefOptions, build *build) (*DeploymentImage, string, error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "local_image_resolver")
+	defer span.End()
 
-	if opts.AppConfig != nil && opts.AppConfig.Build != nil {
-		return opts.AppConfig.Build.Image
-	}
-
-	return ""
-}
-
-func (s *localImageResolver) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts RefOptions) (*DeploymentImage, error) {
-	if !dockerFactory.mode.IsLocal() {
-		terminal.Debug("local docker daemon not available, skipping")
-		return nil, nil
+	build.BuildStart()
+	if !dockerFactory.IsLocal() {
+		note := "local docker daemon not available, skipping"
+		terminal.Debug(note)
+		span.AddEvent(note)
+		build.BuildFinish()
+		return nil, note, nil
 	}
 
 	if opts.Tag == "" {
-		opts.Tag = newDeploymentTag(opts.AppName, opts.ImageLabel)
+		opts.Tag = NewDeploymentTag(opts.AppName, opts.ImageLabel)
 	}
 
-	ref := imageRefFromOpts(opts)
+	span.SetAttributes(opts.ToSpanAttributes()...)
 
-	if ref == "" {
-		terminal.Debug("no image reference found, skipping")
-		return nil, nil
-	}
-
-	docker, err := dockerFactory.buildFn(ctx)
+	build.BuilderInitStart()
+	docker, err := dockerFactory.buildFn(ctx, build)
+	build.BuilderInitFinish()
 	if err != nil {
-		return nil, err
+		build.BuildFinish()
+		return nil, "", err
+	}
+	defer docker.Close() // skipcq: GO-S2307
+
+	serverInfo, err := docker.Info(ctx)
+	if err != nil {
+		span.AddEvent(fmt.Sprintf("error fetching docker server info:%s", err.Error()))
+		terminal.Debug("error fetching docker server info:", err)
+	} else {
+		buildkitEnabled, err := buildkitEnabled(docker)
+		terminal.Debugf("buildkitEnabled %v", buildkitEnabled)
+		span.SetAttributes(attribute.Bool("docker.buildkit_enabled", buildkitEnabled))
+		if err == nil {
+			build.SetBuilderMetaPart2(buildkitEnabled, serverInfo.ServerVersion, fmt.Sprintf("%s/%s/%s", serverInfo.OSType, serverInfo.Architecture, serverInfo.OSVersion))
+		}
 	}
 
-	fmt.Fprintf(streams.ErrOut, "Searching for image '%s' locally...\n", ref)
+	fmt.Fprintf(streams.ErrOut, "Searching for image '%s' locally...\n", opts.ImageRef)
 
-	img, err := findImageWithDocker(docker, ctx, ref)
+	img, err := findImageWithDocker(ctx, docker, opts.ImageRef)
 	if err != nil {
-		return nil, err
+		build.BuildFinish()
+		tracing.RecordError(span, err, "failed to find image with docker")
+		return nil, "", err
 	}
 	if img == nil {
-		return nil, nil
+		build.BuildFinish()
+		span.AddEvent("no image found and no error occurred")
+		return nil, "no image found and no error occurred", nil
 	}
 
+	build.BuildFinish()
 	fmt.Fprintf(streams.ErrOut, "image found: %s\n", img.ID)
 
+	span.SetAttributes(attribute.String("image.id", img.ID))
+
 	if opts.Publish {
+		build.PushStart()
 		err = docker.ImageTag(ctx, img.ID, opts.Tag)
 		if err != nil {
-			return nil, errors.Wrap(err, "error tagging image")
+			build.PushFinish()
+			tracing.RecordError(span, err, "failed to tag image")
+			return nil, "", errors.Wrap(err, "error tagging image")
 		}
 
 		defer clearDeploymentTags(ctx, docker, opts.Tag)
@@ -78,7 +97,8 @@ func (s *localImageResolver) Run(ctx context.Context, dockerFactory *dockerClien
 		cmdfmt.PrintBegin(streams.ErrOut, "Pushing image to fly")
 
 		if err := pushToFly(ctx, docker, streams, opts.Tag); err != nil {
-			return nil, err
+			build.PushFinish()
+			return nil, "", err
 		}
 
 		cmdfmt.PrintDone(streams.ErrOut, "Pushing image done")
@@ -90,21 +110,30 @@ func (s *localImageResolver) Run(ctx context.Context, dockerFactory *dockerClien
 		Size: img.Size,
 	}
 
-	return di, nil
+	span.SetAttributes(di.ToSpanAttributes()...)
+
+	return di, "", nil
 }
 
 var imageIDPattern = regexp.MustCompile("[a-f0-9]")
 
-func findImageWithDocker(d *dockerclient.Client, ctx context.Context, imageName string) (*types.ImageSummary, error) {
+func findImageWithDocker(ctx context.Context, d *dockerclient.Client, imageName string) (*image.Summary, error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "find_image_with_docker")
+	defer span.End()
+
 	ref, err := dockerparser.Parse(imageName)
 	if err != nil {
+		tracing.RecordError(span, err, "failed to parse image")
 		return nil, err
 	}
 
+	span.SetAttributes(attribute.String("ref", ref.Name()))
+
 	isID := imageIDPattern.MatchString(imageName)
 
-	images, err := d.ImageList(ctx, types.ImageListOptions{})
+	images, err := d.ImageList(ctx, image.ListOptions{})
 	if err != nil {
+		tracing.RecordError(span, err, "failed to list images")
 		return nil, err
 	}
 
@@ -130,6 +159,8 @@ func findImageWithDocker(d *dockerclient.Client, ctx context.Context, imageName 
 	}
 
 	terminal.Debug("Search terms:", searchTerms)
+
+	span.SetAttributes(attribute.StringSlice("search_terms", searchTerms))
 
 	for _, img := range images {
 		for _, tag := range img.RepoTags {
