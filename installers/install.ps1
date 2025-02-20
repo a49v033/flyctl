@@ -46,7 +46,21 @@ if (!(Test-Path $BinDir)) {
   New-Item $BinDir -ItemType Directory | Out-Null
 }
 
-Invoke-WebRequest $FlyUri -OutFile $FlyZip -UseBasicParsing
+$prevProgressPreference = $ProgressPreference
+try {
+  # Invoke-WebRequest on older powershell versions has severe transfer
+  # performance issues due to progress bar rendering - the screen updates
+  # end up throttling the download itself. Disable progress on these older
+  # versions.
+  if ($PSVersionTable.PSVersion.Major -lt 7) {
+    Write-Output "Downloading flyctl..."
+    $ProgressPreference = "SilentlyContinue"
+  }
+
+  Invoke-WebRequest $FlyUri -OutFile $FlyZip -UseBasicParsing
+} finally {
+  $ProgressPreference = $prevProgressPreference
+}
 
 if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) {
   Expand-Archive $FlyZip -Destination $BinDir -Force
@@ -67,7 +81,16 @@ if (!(";$Path;".ToLower() -like "*;$BinDir;*".ToLower())) {
   $Env:Path += ";$BinDir"
 }
 
-Start-Process -FilePath "$env:comspec" -ArgumentList "/c", "mklink", $FlyExe, $FlyctlExe
+if (!(Get-Item $FlyExe -ErrorAction SilentlyContinue).LinkTarget) {
+  # if fly.exe is not already a symlink, make it so.
+
+  # delete any existing file
+  Remove-Item $FlyExe -ErrorAction SilentlyContinue
+
+  # creating symlinks on windows requires administrator privileges by default,
+  # passing `-Verb runAs` means we'll pop up a UAC dialog here
+  Start-Process -FilePath "$env:comspec" -ArgumentList "/c", "mklink", $FlyExe, $FlyctlExe -Verb runAs -WorkingDirectory "$env:windir"
+}
 
 Write-Output "flyctl was installed successfully to $FlyctlExe"
 Write-Output "Run 'flyctl --help' to get started"

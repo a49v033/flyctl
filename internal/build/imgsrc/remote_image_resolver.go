@@ -3,44 +3,60 @@ package imgsrc
 import (
 	"context"
 	"fmt"
+	"strconv"
 
-	"github.com/superfly/flyctl/api"
-	"github.com/superfly/flyctl/pkg/iostreams"
-	"github.com/superfly/flyctl/terminal"
+	"github.com/superfly/fly-go"
+	"github.com/superfly/flyctl/internal/tracing"
+	"github.com/superfly/flyctl/iostreams"
+	"go.opentelemetry.io/otel/trace"
 )
 
-type remoteImageResolver struct {
-	flyApi *api.Client
+type flyClient interface {
+	ResolveImageForApp(ctx context.Context, appName, imageRef string) (*fly.Image, error)
 }
 
-func (s *remoteImageResolver) Name() string {
+type remoteImageResolver struct {
+	flyApi flyClient
+}
+
+func (*remoteImageResolver) Name() string {
 	return "Remote Image Reference"
 }
 
-func (s *remoteImageResolver) Run(ctx context.Context, dockerFactory *dockerClientFactory, streams *iostreams.IOStreams, opts RefOptions) (*DeploymentImage, error) {
-	ref := imageRefFromOpts(opts)
-	if ref == "" {
-		terminal.Debug("no image reference found, skipping")
-		return nil, nil
-	}
+func (s *remoteImageResolver) Run(ctx context.Context, _ *dockerClientFactory, streams *iostreams.IOStreams, opts RefOptions, build *build) (*DeploymentImage, string, error) {
+	ctx, span := tracing.GetTracer().Start(ctx, "remote_image_resolver", trace.WithAttributes(opts.ToSpanAttributes()...))
+	defer span.End()
 
-	fmt.Fprintf(streams.ErrOut, "Searching for image '%s' remotely...\n", ref)
+	fmt.Fprintf(streams.ErrOut, "Searching for image '%s' remotely...\n", opts.ImageRef)
 
-	img, err := s.flyApi.ResolveImageForApp(ctx, opts.AppName, ref)
+	build.BuildStart()
+	img, err := s.flyApi.ResolveImageForApp(ctx, opts.AppName, opts.ImageRef)
+	build.BuildFinish()
 	if err != nil {
-		return nil, err
+		tracing.RecordError(span, err, "failed to resolve image")
+		return nil, "", err
 	}
 	if img == nil {
-		return nil, nil
+		span.AddEvent("no image found and no error occurred")
+		return nil, "no image found and no error occurred", nil
 	}
 
 	fmt.Fprintf(streams.ErrOut, "image found: %s\n", img.ID)
 
-	di := &DeploymentImage{
-		ID:   img.ID,
-		Tag:  img.Ref,
-		Size: int64(img.CompressedSize),
+	size, err := strconv.ParseUint(img.CompressedSize, 10, 64)
+	if err != nil {
+		tracing.RecordError(span, err, "failed to parse size")
+		return nil, "", err
 	}
 
-	return di, nil
+	di := &DeploymentImage{
+		ID:     img.ID,
+		Tag:    img.Ref,
+		Digest: img.Digest,
+		Size:   int64(size),
+	}
+
+	span.SetAttributes(di.ToSpanAttributes()...)
+
+	return di, "", nil
 }

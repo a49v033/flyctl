@@ -2,14 +2,18 @@ package imgsrc
 
 import (
 	"archive/tar"
+	"bytes"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/docker/docker/builder/dockerignore"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/fileutils"
+	"github.com/moby/buildkit/frontend/dockerfile/dockerignore"
+	"github.com/moby/patternmatcher"
+	"github.com/pkg/errors"
+	"github.com/superfly/flyctl/terminal"
 )
 
 type archiveOptions struct {
@@ -17,6 +21,56 @@ type archiveOptions struct {
 	exclusions []string
 	compressed bool
 	additions  map[string][]byte
+}
+
+type ArchiveInfo struct {
+	SizeInBytes int
+	Content     []byte
+}
+
+func CreateArchive(dockerfile, workingDir, ignoreFile string, compressed bool) (*ArchiveInfo, error) {
+	archiveOpts := archiveOptions{
+		sourcePath: workingDir,
+		compressed: compressed,
+	}
+
+	relativeDockerfilePath := ""
+
+	// copy dockerfile into the archive if it's outside the context dir
+	if !isPathInRoot(dockerfile, workingDir) {
+		dockerfileData, err := os.ReadFile(dockerfile)
+		if err != nil {
+			return nil, errors.Wrap(err, "error reading Dockerfile")
+		}
+		archiveOpts.additions = map[string][]byte{
+			"Dockerfile": dockerfileData,
+		}
+	} else {
+		p, err := filepath.Rel(workingDir, dockerfile)
+		if err != nil {
+			return nil, err
+		}
+		relativeDockerfilePath = filepath.ToSlash(p)
+	}
+
+	excludes, err := readDockerignore(workingDir, ignoreFile, relativeDockerfilePath)
+	if err != nil {
+		return nil, errors.Wrap(err, "error reading .dockerignore")
+	}
+	archiveOpts.exclusions = excludes
+
+	r, err := archiveDirectory(archiveOpts)
+	if err != nil {
+		return nil, err
+	}
+	contentBuf := new(bytes.Buffer)
+	contentBuf.ReadFrom(r)
+	content := contentBuf.Bytes()
+	archiveInfo := &ArchiveInfo{
+		SizeInBytes: len(content),
+		Content:     content,
+	}
+	return archiveInfo, err
 }
 
 func archiveDirectory(options archiveOptions) (io.ReadCloser, error) {
@@ -27,7 +81,11 @@ func archiveDirectory(options archiveOptions) (io.ReadCloser, error) {
 		opts.Compression = archive.Gzip
 	}
 
-	r, err := archive.TarWithOptions(options.sourcePath, opts)
+	sourcePath, err := fileutils.ReadSymlinkedDirectory(options.sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	r, err := archive.TarWithOptions(sourcePath, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -51,38 +109,48 @@ func archiveDirectory(options archiveOptions) (io.ReadCloser, error) {
 	return r, nil
 }
 
-func readDockerignore(workingDir string) ([]string, error) {
-	file, err := os.Open(filepath.Join(workingDir, ".dockerignore"))
+func readDockerignore(workingDir, ignoreFile, relativeDockerfilePath string) ([]string, error) {
+	if ignoreFile == "" {
+		ignoreFile = filepath.Join(workingDir, ".dockerignore")
+	}
+
+	file, err := os.Open(ignoreFile)
 	if os.IsNotExist(err) {
-		return []string{}, nil
+		// ignore fly.toml by default if no dockerignore file is provided
+		return []string{"fly.toml"}, nil
 	} else if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		err := file.Close()
+		if err != nil {
+			terminal.Debugf("error closing dockerignore %s: %v\n", ignoreFile, err)
+		}
+	}()
 
-	return parseDockerignore(file)
+	return parseDockerignore(file, relativeDockerfilePath)
 }
 
-func parseDockerignore(r io.Reader) ([]string, error) {
+func parseDockerignore(r io.Reader, dockerfile string) ([]string, error) {
 	excludes, err := dockerignore.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
 
-	if match, _ := fileutils.Matches("fly.toml", excludes); !match {
-		excludes = append(excludes, "fly.toml")
-	}
-
-	if match, _ := fileutils.Matches(".dockerignore", excludes); match {
+	if match, _ := patternmatcher.Matches(".dockerignore", excludes); match {
 		excludes = append(excludes, "!.dockerignore")
 	}
 
-	if match, _ := fileutils.Matches("Dockerfile", excludes); match {
-		excludes = append(excludes, "![Dd]ockerfile")
-	}
-
-	if match, _ := fileutils.Matches("dockerfile", excludes); match {
-		excludes = append(excludes, "![Dd]ockerfile")
+	if dockerfile != "" {
+		if match, _ := patternmatcher.Matches(dockerfile, excludes); match {
+			excludes = append(excludes, "!"+dockerfile)
+		}
+	} else {
+		if match, _ := patternmatcher.Matches("Dockerfile", excludes); match {
+			excludes = append(excludes, "![Dd]ockerfile")
+		} else if match, _ := patternmatcher.Matches("dockerfile", excludes); match {
+			excludes = append(excludes, "![Dd]ockerfile")
+		}
 	}
 
 	return excludes, nil
